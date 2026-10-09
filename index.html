@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>WebMark – GPU benchmark in a tab</title>
+<style>
+:root{--bg:#e8edf1;--ink:#12222e;--mute:#566673;--line:#b9c4cc;--acc:#0050ff;--hot:#ff4b2b;--panel:#f6f8fa;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#101a22;--ink:#e6edf2;--mute:#8fa2b0;--line:#2b3b48;--acc:#5b8dff;--hot:#ff6a4d;--panel:#16232d}}
+:root[data-theme="dark"]{--bg:#101a22;--ink:#e6edf2;--mute:#8fa2b0;--line:#2b3b48;--acc:#5b8dff;--hot:#ff6a4d;--panel:#16232d}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 "Bahnschrift","DIN Alternate","Segoe UI",Arial,sans-serif}
+main{max-width:1100px;margin:0 auto;padding:28px 20px 60px}
+h1{font-size:clamp(34px,6vw,64px);line-height:1;margin:0 0 10px;letter-spacing:-.02em;font-weight:700}
+.sub{color:var(--mute);max-width:60ch;margin:0 0 24px}
+.stage{position:relative;border:2px solid var(--ink);background:#000;aspect-ratio:16/9;overflow:hidden}
+canvas{width:100%;height:100%;display:block}
+.hud{position:absolute;left:12px;top:10px;color:#fff;font-size:14px;text-shadow:0 1px 3px #000;pointer-events:none}
+.hud b{font-size:30px;display:block;line-height:1}
+.bar{position:absolute;left:0;bottom:0;height:5px;background:var(--hot);width:0}
+.row{display:flex;gap:14px;flex-wrap:wrap;align-items:center;margin:18px 0}
+button{font:inherit;font-weight:700;background:var(--acc);color:#fff;border:0;padding:14px 28px;cursor:pointer}
+button:disabled{opacity:.5;cursor:default}
+button:focus-visible{outline:3px solid var(--hot);outline-offset:2px}
+.gpu{color:var(--mute);font-size:14px}
+.res{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:0;border:1px solid var(--line);background:var(--panel)}
+.res div{padding:16px 18px;border-right:1px solid var(--line)}
+.res div:last-child{border-right:0}
+.res small{color:var(--mute);display:block}
+.res strong{font-size:34px;line-height:1.1}
+.total strong{color:var(--acc);font-size:44px}
+.err{border-left:5px solid var(--hot);padding:12px 16px;background:var(--panel);display:none}
+.note{color:var(--mute);font-size:13px;margin-top:22px;max-width:75ch}
+</style></head><body><main>
+<h1>WebMark</h1>
+<p class="sub">A GPU benchmark that runs in this tab, talking to your graphics card directly through WebGPU. Two tests, about 20 seconds.</p>
+<div class="err" id="err"></div>
+<div class="stage"><canvas id="c" width="1280" height="720"></canvas>
+<div class="hud"><span id="tn">Ready</span><b id="fps">–</b>frames per second</div><div class="bar" id="bar"></div></div>
+<div class="row"><button id="go">Run benchmark</button><span class="gpu" id="gpu"></span></div>
+<div class="res">
+<div><small>Nebula – compute, 65,536 bodies</small><strong id="s1">–</strong></div>
+<div><small>Fractal – shader, 1280×720</small><strong id="s2">–</strong></div>
+<div class="total"><small>WebMark score</small><strong id="st">–</strong></div></div>
+<p class="note">Frames are rendered off-screen and timed with the GPU queue, so the result is not capped by your monitor's refresh rate. Scores are only comparable between runs of WebMark, not with 3DMark. Close other tabs for steadier results.</p>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+const N=65536,ATT=1024;
+const COMPUTE=`
+struct P{pos:vec4f,vel:vec4f};
+@group(0)@binding(0) var<storage,read_write> ps:array<P>;
+@group(0)@binding(1) var<uniform> u:vec4f;
+@compute @workgroup_size(64) fn cs(@builtin(global_invocation_id) id:vec3u){
+ let i=id.x; if(i>=${N}u){return;}
+ var p=ps[i]; var a=vec3f(0);
+ for(var j=0u;j<${ATT}u;j++){
+  let q=ps[j*${N/ATT}u].pos; let d=q.xyz-p.pos.xyz;
+  let r2=dot(d,d)+0.04; a+=d*(q.w*inverseSqrt(r2*r2*r2));
+ }
+ a-=p.pos.xyz*0.15;
+ p.vel=vec4f(p.vel.xyz*0.9995+a*u.x*0.002,0);
+ p.pos=vec4f(p.pos.xyz+p.vel.xyz*u.x,p.pos.w);
+ ps[i]=p;
+}`;
+const DRAW=`
+struct P{pos:vec4f,vel:vec4f};
+@group(0)@binding(0) var<storage,read> ps:array<P>;
+@group(0)@binding(1) var<uniform> u:vec4f;
+struct V{@builtin(position) pos:vec4f,@location(0) uv:vec2f,@location(1) col:vec3f};
+@vertex fn vs(@builtin(vertex_index) vi:u32,@builtin(instance_index) ii:u32)->V{
+ var c=array<vec2f,6>(vec2f(-1,-1),vec2f(1,-1),vec2f(-1,1),vec2f(-1,1),vec2f(1,-1),vec2f(1,1));
+ let p=ps[ii]; let a=u.y*0.15; let ca=cos(a); let sa=sin(a);
+ let x=p.pos.x*ca-p.pos.z*sa; let z=p.pos.x*sa+p.pos.z*ca+3.5;
+ let sp=vec2f(x,p.pos.y)/max(z,0.2)*1.6;
+ let s=length(p.vel.xyz); var o:V;
+ o.pos=vec4f((sp+c[vi]*0.006)*vec2f(1,u.z),0,1);
+ o.uv=c[vi]; o.col=mix(vec3f(0.1,0.3,1.0),vec3f(1.0,0.35,0.15),clamp(s*0.6,0.0,1.0));
+ return o;}
+@fragment fn fs(v:V)->@location(0) vec4f{
+ let d=1.0-dot(v.uv,v.uv); if(d<0.0){discard;}
+ return vec4f(v.col*d*0.35,1);}`;
+const FRACT=`
+@group(0)@binding(0) var<uniform> u:vec4f;
+@vertex fn vs(@builtin(vertex_index) i:u32)->@builtin(position) vec4f{
+ var p=array<vec2f,3>(vec2f(-1,-1),vec2f(3,-1),vec2f(-1,3)); return vec4f(p[i],0,1);}
+fn de(p:vec3f)->f32{
+ var z=p; var dr=1.0; var r=0.0;
+ for(var i=0;i<8;i++){
+  r=length(z); if(r>2.0){break;}
+  let th=acos(clamp(z.z/r,-1.0,1.0)); let ph=atan2(z.y,z.x);
+  dr=pow(r,7.0)*8.0*dr+1.0;
+  let zr=pow(r,8.0); let t=th*8.0; let f=ph*8.0;
+  z=zr*vec3f(sin(t)*cos(f),sin(t)*sin(f),cos(t))+p;
+ }
+ return 0.5*log(r)*r/dr;}
+@fragment fn fs(@builtin(position) fc:vec4f)->@location(0) vec4f{
+ let uv=(fc.xy-0.5*vec2f(u.y,u.z))/u.z; let a=u.x*0.3;
+ let ro=vec3f(sin(a),0.35,cos(a))*2.4; let fw=normalize(-ro);
+ let rt=normalize(cross(fw,vec3f(0,1,0))); let up=cross(rt,fw);
+ let rd=normalize(fw*1.6+rt*uv.x-up*uv.y);
+ var t=0.0; var s=0; var hit=false;
+ for(s=0;s<110;s++){
+  let d=de(ro+rd*t); if(d<0.0006){hit=true;break;} t+=d; if(t>6.0){break;}
+ }
+ var col=vec3f(0.02,0.04,0.08)+vec3f(0.05,0.08,0.2)*(1.0-uv.y);
+ if(hit){
+  let p=ro+rd*t; let e=vec2f(0.001,0.0);
+  let n=normalize(vec3f(de(p+e.xyy)-de(p-e.xyy),de(p+e.yxy)-de(p-e.yxy),de(p+e.yyx)-de(p-e.yyx)));
+  let l=normalize(vec3f(0.6,0.8,-0.3)); let dif=max(dot(n,l),0.0);
+  let ao=1.0-f32(s)/110.0;
+  col=mix(vec3f(0.9,0.35,0.15),vec3f(0.2,0.45,1.0),n.y*0.5+0.5)*(0.15+dif)*ao*1.6;
+ }
+ return vec4f(pow(col,vec3f(0.85)),1);}`;
+
+let dev,fmt,ctx,tex,tests;
+async function init(){
+ if(!navigator.gpu) throw new Error("WebGPU isn't available in this browser. Use a recent Chrome, Edge, or Safari on a device with a GPU, then reload.");
+ const ad=await navigator.gpu.requestAdapter({powerPreference:"high-performance"});
+ if(!ad) throw new Error("No GPU adapter found. Check that hardware acceleration is turned on in your browser settings.");
+ dev=await ad.requestDevice();
+ const i=ad.info||{}; $("gpu").textContent=[i.vendor,i.architecture,i.description].filter(Boolean).join(" ")||"GPU detected";
+ fmt=navigator.gpu.getPreferredCanvasFormat();
+ ctx=$("c").getContext("webgpu");
+ ctx.configure({device:dev,format:fmt,usage:GPUTextureUsage.RENDER_ATTACHMENT|GPUTextureUsage.COPY_DST});
+ tex=dev.createTexture({size:[1280,720],format:fmt,usage:GPUTextureUsage.RENDER_ATTACHMENT|GPUTextureUsage.COPY_SRC});
+ const U=()=>dev.createBuffer({size:16,usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST});
+ // nebula
+ const data=new Float32Array(N*8);
+ for(let k=0;k<N;k++){
+  const r=Math.cbrt(Math.random())*1.4,th=Math.random()*6.283,ph=Math.acos(2*Math.random()-1);
+  const x=r*Math.sin(ph)*Math.cos(th),y=r*Math.sin(ph)*Math.sin(th),z=r*Math.cos(ph);
+  data.set([x,y,z,0.6+Math.random()*0.8,-y*0.5,x*0.5,0,0],k*8);
+ }
+ const ps=dev.createBuffer({size:data.byteLength,usage:GPUBufferUsage.STORAGE,mappedAtCreation:true});
+ new Float32Array(ps.getMappedRange()).set(data);ps.unmap();
+ const u1=U();
+ const cp=dev.createComputePipeline({layout:"auto",compute:{module:dev.createShaderModule({code:COMPUTE}),entryPoint:"cs"}});
+ const dm=dev.createShaderModule({code:DRAW});
+ const rp=dev.createRenderPipeline({layout:"auto",vertex:{module:dm,entryPoint:"vs"},
+  fragment:{module:dm,entryPoint:"fs",targets:[{format:fmt,blend:{color:{srcFactor:"one",dstFactor:"one"},alpha:{srcFactor:"one",dstFactor:"one"}}}]}});
+ const bc=dev.createBindGroup({layout:cp.getBindGroupLayout(0),entries:[{binding:0,resource:{buffer:ps}},{binding:1,resource:{buffer:u1}}]});
+ const br=dev.createBindGroup({layout:rp.getBindGroupLayout(0),entries:[{binding:0,resource:{buffer:ps}},{binding:1,resource:{buffer:u1}}]});
+ // fractal
+ const u2=U(); const fm=dev.createShaderModule({code:FRACT});
+ const fp=dev.createRenderPipeline({layout:"auto",vertex:{module:fm,entryPoint:"vs"},fragment:{module:fm,entryPoint:"fs",targets:[{format:fmt}]}});
+ const bf=dev.createBindGroup({layout:fp.getBindGroupLayout(0),entries:[{binding:0,resource:{buffer:u2}}]});
+ const pass=(enc,clear)=>enc.beginRenderPass({colorAttachments:[{view:tex.createView(),loadOp:"clear",clearValue:clear,storeOp:"store"}]});
+ tests=[
+  {name:"Test 1 of 2: Nebula",frame(enc,t){
+    dev.queue.writeBuffer(u1,0,new Float32Array([1/60,t,1280/720,0]));
+    const c=enc.beginComputePass();c.setPipeline(cp);c.setBindGroup(0,bc);c.dispatchWorkgroups(N/64);c.end();
+    const r=pass(enc,{r:0.01,g:0.015,b:0.03,a:1});r.setPipeline(rp);r.setBindGroup(0,br);r.draw(6,N);r.end();}},
+  {name:"Test 2 of 2: Fractal",frame(enc,t){
+    dev.queue.writeBuffer(u2,0,new Float32Array([t,1280,720,0]));
+    const r=pass(enc,{r:0,g:0,b:0,a:1});r.setPipeline(fp);r.setBindGroup(0,bf);r.draw(3);r.end();}}
+ ];
+}
+async function run(t,dur){
+ $("tn").textContent=t.name;const warm=1500,t0=performance.now();let frames=0,mStart=0,last=t0,n=0;
+ while(true){
+  const now=performance.now(),el=now-t0; if(el>warm+dur)break;
+  const enc=dev.createCommandEncoder();
+  t.frame(enc,el/1000);
+  enc.copyTextureToTexture({texture:tex},{texture:ctx.getCurrentTexture()},[1280,720]);
+  dev.queue.submit([enc.finish()]);
+  await dev.queue.onSubmittedWorkDone();
+  const e=performance.now();
+  if(el>=warm){if(!mStart)mStart=e;frames++;}
+  n++;if(e-last>400){$("fps").textContent=Math.round(n*1000/(e-last));n=0;last=e;}
+  $("bar").style.width=Math.min(100,el/(warm+dur)*100)+"%";
+ }
+ return frames*1000/(performance.now()-mStart);
+}
+$("go").onclick=async()=>{
+ const b=$("go"),err=$("err");b.disabled=true;err.style.display="none";
+ ["s1","s2","st"].forEach(i=>$(i).textContent="–");
+ try{
+  if(!dev)await init();
+  dev.lost.then(i=>{err.textContent="The GPU device was lost: "+i.message+". Reload the page and run again.";err.style.display="block";});
+  const f1=await run(tests[0],8000);const s1=Math.round(f1*100);$("s1").textContent=s1.toLocaleString();
+  const f2=await run(tests[1],8000);const s2=Math.round(f2*100);$("s2").textContent=s2.toLocaleString();
+  $("st").textContent=Math.round(Math.sqrt(s1*s2)).toLocaleString();
+  $("tn").textContent="Done";$("fps").textContent="–";b.textContent="Run again";
+ }catch(e){err.textContent=e.message;err.style.display="block";$("tn").textContent="Stopped";}
+ b.disabled=false;
+};
+</script></body></html>

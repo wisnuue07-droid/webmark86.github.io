@@ -1,1 +1,3 @@
-# webmark86.github.io
+# WebMark
+
+A WebGPU GPU benchmark that runs in a browser tab.
